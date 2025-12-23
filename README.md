@@ -1,4 +1,4 @@
-# SMSM_supplementary
+# SMSM Supplementary Repository
 Supplementary materials for the paper "Hierarchical Semi-Markov Smooth Models of Latent Neural States"
 by Krause, van Rij, and Borst (submitted).
 
@@ -19,7 +19,7 @@ from Github. See [here](https://github.com/JoKra1/mssm/tree/1.2.0) for instructi
 might also have to be installed from GitHub. See [here](https://github.com/GWeindel/hmp).
 
 Then you can:
- - clone this repository
+ - Clone this repository
  - Get the RT data ("rt_dat.csv") and EEG data ("data4HMM_baseline_LD_excl_6_15_bs_100_.mat") from Krause et al. (2024)
 
 
