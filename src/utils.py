@@ -1257,7 +1257,14 @@ def sample_hmp(
     callback=None,
     n_chains=2,
     parallelize_chains=True,
-):
+) -> tuple[np.ndarray, np.ndarray, GSMM]:
+    """Laplace approximate beam sampler for a HMP-like HsMM as discussed by by Krause, van Rij, and
+    Borst (submitted).
+
+    :return: Samples for the coefficients, regularization parameters, and a GSMM initialized with
+        the average coefficients.
+    :rtype: tuple[np.ndarray, np.ndarray, GSMM]
+    """
 
     # Extract families, transition matrices, etc.
     n_S = fam.llkargs[0]
@@ -1486,6 +1493,7 @@ def plot_hsmm(
     fig: matplotlib.figure.Figure | None = None,
     axs: list[matplotlib.axes._axes.Axes] | None = None,
 ):
+    """Plot an overview for an estimated HsMM model."""
 
     # Extract model quantities of interest for plotting
     if isinstance(model, GSMM):
@@ -2053,6 +2061,7 @@ def plot_val_hsmm(
     alpha: float = 1,
     fig: matplotlib.figure.Figure | None = None,
 ):
+    """Generate different validation plots for an estimated HsMM model."""
 
     np_gen = np.random.default_rng(seed)
     # Extract model quantities of interest for plotting
