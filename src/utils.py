@@ -18,6 +18,7 @@ from mssm.models import (
     GSMM,
     Identity,
 )
+from mssm.src.python.custom_types import DerivOrder
 
 from mssmViz.plot import plot, plot_fitted
 import multiprocess as mp
@@ -425,19 +426,51 @@ class GAMMA2(GAMLSSFamily):
         # see also: Rigby, R. A., & Stasinopoulos, D. M. (2005). Generalized Additive Models for
         # Location, Scale and Shape.
 
-        def d11(y, mu):
-            return (y - mu) / (0.5 * np.power(mu, 2))
+    def dpars(
+        self, y: np.ndarray, *mus: np.ndarray, index: int, order: DerivOrder
+    ) -> np.ndarray:
+        """Returns partial derivatives of the log-likelihood with respect to the mean and scale
+        or a combination indexed by ``index`` of ``order`` (first order, pure second,
+        mixed second).
 
-        self.d1: list[Callable] = [d11]
+        All derivatives taken from gamlss.dist: https://github.com/gamlss-dev/gamlss.dist see
+        also: Rigby, R. A., & Stasinopoulos, D. M. (2005).
 
-        def d21(y, mu):
-            return -1 / (0.5 * np.power(mu, 2))
+        References:
+         - Rigby, R. A., & Stasinopoulos, D. M. (2005). Generalized Additive Models for \
+            Location, Scale and Shape.
 
-        self.d2: list[Callable] = [d21]
+        :param y: A numpy array of shape (-1,1) containing each observed value.
+        :type y: np.ndarray
+        :param mus: 1 np array for the mean corresponding to each of N observations. Array is of
+            shape (N,1).
+        :type mus: np.ndarray
+        :param index: Index for specific derivative vector to return.
+        :type index: int
+        :param order: Order of partial derivative.
+        :type order: DerivOrder
+        :return: a N-dimensional vector of shape (-1,1) containing the desired derivative evaluated
+            for every observation in ``y``.
+        :rtype: np.ndarray
+        """
+        mu = mus[0]
 
-        self.d2m: list[Callable] = []
+        if order == DerivOrder.d1:
+            if index == 0:
+                return (y - mu) / (0.5 * np.power(mu, 2))
+            else:
+                raise ValueError("No Derivative of order d1 exists at index > 0.")
 
-    def lp(self, y: np.ndarray, mu: np.ndarray) -> np.ndarray:
+        elif order == DerivOrder.d2:
+            if index == 0:
+                return -1 / (0.5 * np.power(mu, 2))
+            else:
+                raise ValueError("No Derivative of order d2 exists at index > 0.")
+
+        elif order == DerivOrder.d2m:
+            raise ValueError("No Derivative > order d2m exists.")
+
+    def lp(self, y: np.ndarray, *mus: np.ndarray) -> np.ndarray:
         """Log-probability of observing every proportion in :math:`\\mathbf{y}` under their
         respective Gamma with mean = :math:`\\boldsymbol{\\mu}` and scale = 0.5.
 
@@ -447,9 +480,9 @@ class GAMMA2(GAMLSSFamily):
 
         :param y: A numpy array containing each observed value.
         :type y: np.ndarray
-        :param mu: A numpy array containing the predicted mean for the response distribution
-            corresponding to each observation.
-        :type mu: np.ndarray
+        :param mus: 1 np array for the mean corresponding to each of N observations. Array is of
+            shape (N,1).
+        :type mus: np.ndarray
         :return: a N-dimensional vector containing the log-probability of observing each data-point
             under the current model.
         :rtype: np.ndarray
@@ -464,11 +497,12 @@ class GAMMA2(GAMLSSFamily):
         # \beta = 1/\\phi/\\mu
         # scipy docs, say to set scale to 1/\beta.
         # see: https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.gamma.html
+        mu = mus[0]
         alpha = 1 / 0.5
         beta = alpha / mu
         return scp.stats.gamma.logpdf(y, a=alpha, scale=(1 / beta))
 
-    def lcp(self, y: np.ndarray, mu: np.ndarray) -> np.ndarray:
+    def lcp(self, y: np.ndarray, *mus: np.ndarray) -> np.ndarray:
         """Log of the cumulative probability of observing every value in y under their respective
         Gamma with mean = :math:`\\boldsymbol{\\mu}` and scale = 0.5.
 
@@ -478,18 +512,19 @@ class GAMMA2(GAMLSSFamily):
 
         :param y: A numpy array containing each observed value.
         :type y: np.ndarray
-        :param mu: A numpy array containing the predicted mean for the response distribution
-            corresponding to each observation.
-        :type mu: np.ndarray
+        :param mus: 1 np array for the mean corresponding to each of N observations. Array is of
+            shape (N,1).
+        :type mus: np.ndarray
         :return: a N-dimensional vector containing the log of the cumulative probability of
             observing each data-point under the current model.
         :rtype: np.ndarray
         """
+        mu = mus[0]
         alpha = 1 / 0.5
         beta = alpha / mu
         return scp.stats.gamma.logcdf(y, a=alpha, scale=(1 / beta))
 
-    def llk(self, y: np.ndarray, mu: np.ndarray) -> float:
+    def llk(self, y: np.ndarray, *mus: np.ndarray) -> float:
         """log-probability of data under given model. Essentially sum over all elements in the
         vector returned by the :func:`lp` method.
 
@@ -499,15 +534,16 @@ class GAMMA2(GAMLSSFamily):
 
         :param y: A numpy array containing each observation.
         :type y: np.ndarray
-        :param mu: A numpy array containing the predicted mean for the response distribution\
-            corresponding to each observation.
-        :type mu: np.ndarray
+        :param mus: 1 np array for the mean corresponding to each of N observations. Array is of
+            shape (N,1).
+        :type mus: np.ndarray
         :return: The log-probability of observing all data under the current model.
         :rtype: float
         """
+        mu = mus[0]
         return sum(self.lp(y, mu))[0]
 
-    def get_resid(self, y: np.ndarray, mu: np.ndarray) -> np.ndarray:
+    def get_resid(self, y: np.ndarray, *mus: np.ndarray) -> np.ndarray:
         """Get standardized residuals for a Gamma GAMMLSS model (Rigby & Stasinopoulos, 2005).
 
         Essentially, to get a standaridzed residual vector we first have to account for the
@@ -525,14 +561,45 @@ class GAMMA2(GAMLSSFamily):
 
         :param y: A numpy array containing each observation.
         :type y: np.ndarray
-        :param mu: A numpy array containing the predicted mean for the response distribution
-            corresponding to each observation.
+        :param mus: 1 np array for the mean corresponding to each of N observations. Array is of
+            shape (N,1).
         :type mu: np.ndarray
         :return: A list of standardized residuals that should be ~ N(0,1) if the model is correct.
         :rtype: np.ndarray
         """
+        mu = mus[0]
         res = np.sign(y - mu) * np.sqrt(Gamma().D(y, mu) / 0.5)
         return res
+
+    def rvs(self, *mus: np.ndarray, size: int = 1, seed: int | None = 0) -> np.ndarray:
+        """Returns ``size`` random samples for each of the distributions parameterized by ``mu``
+        and ``scale``.
+
+        References:
+         - Wood, S. N. (2017). Generalized Additive Models: An Introduction with R, Second \
+            Edition (2nd ed.).
+
+        :param mus: 1 np array for the mean corresponding to each of N observations. Array is of
+            shape (N,1).
+        :type mus: np.ndarray
+        :param size: Number of random samples to return per distribution. Defaults to 1.
+        :type size: int, optional
+        :param seed: Seed to use for random number generation. Defaults to 0.
+        :type seed: int, optional
+        :return: a numpy array of shape ``(size, mus[0].shape[0])`` containing random
+            samples from every distribution parameterized by ``mu`` and ``scale``.
+        :rtype: np.ndarray
+        """
+        mu = mus[0]
+        scale = 0.5
+        alpha = 1 / scale
+        beta = alpha / mu
+        return scp.stats.gamma.rvs(
+            size=(size, mu.shape[0]),
+            a=alpha.flatten(),
+            scale=(1 / beta.flatten()),
+            random_state=seed,
+        )
 
     def init_coef(self, models: list[Callable]) -> np.ndarray:
         """Function to initialize the coefficients of the model.
