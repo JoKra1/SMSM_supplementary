@@ -7,6 +7,7 @@ from collections.abc import Callable
 from mssm.models import (
     Gamma,
     GAMLSSFamily,
+    GSMMFamily,
     Link,
     Formula,
     HSMMFamily,
@@ -17,11 +18,23 @@ from mssm.models import (
     GAMMALS,
     GSMM,
     Identity,
+    DifferencePenalty,
+    f,
+    LOG,
+    MULNOMLSS,
+    i,
 )
-from mssm.src.python.custom_types import DerivOrder
+from mssm.src.python.repara import reparam
+from mssm.src.python.custom_types import DerivOrder, SamplerResult
+from mssm.src.python.matrix_solvers import map_csc_to_eigen, cpp_solve_coef
+from mssm.src.python.hsmm import (
+    _split_matrices,
+    _compute_series_probs,
+)
+from mssm.src.python.discrete import DiscreteModelMatrix
 
 from mssmViz.plot import plot, plot_fitted
-import multiprocess as mp
+import multiprocessing as mp
 import networkx as nx
 import matplotlib
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -34,7 +47,8 @@ from mssm.src.python.utils import estimateVp
 from mssm.src.python.formula import build_model_matrix, build_penalties
 from mssm.src.python.matrix_solvers import translate_sparse
 from mssm.src.python.mcmc import check_convergence
-from mssm.src.python.hsmm import _split_matrices
+from mssm.src.python.gamm_solvers import compute_S_emb_pinv_det
+from mssmViz.sim import sim18
 import warnings
 import os.path as op
 import os
@@ -64,7 +78,265 @@ def event_shape(sfreq, event_width):
     return template
 
 
-def simulate(
+def get_hmp_event_probs_series(
+    fam: HSMMFamily,
+    series: int,
+    coef: np.ndarray,
+    coef_split_idx: list[int],
+    ys: list[np.ndarray | None],
+    Xs: list[scp.sparse.csc_array | np.ndarray | DiscreteModelMatrix | None],
+) -> np.ndarray:
+    """Computes the probability of each event at every time-point for trial ``series``.
+
+    :param fam: Family of the model
+    :type fam: HSMMFamily
+    :param coef: The current coefficient estimate (as np.array of shape (-1,1) - so it must not
+        be flattened!).
+    :type coef: np.ndarray
+    :param coef_split_idx: A list used to split (via :func:`np.split`) the ``coef`` into the
+        sub-sets associated with each paramter of the llk.
+    :type coef_split_idx: list[int]
+    :param ys: List containing the vectors of observations (each of shape (-1,1)) passed as
+        ``lhs.variable`` to the formulas. **Note**: by convention ``mssm`` expectes that the
+        actual observed data is passed along via the first formula (so it is stored in
+        ``ys[0]``). If multiple formulas have the same ``lhs.variable`` as this first formula,
+        then ``ys`` contains ``None`` at their indices to save memory.
+    :type ys: [np.ndarray or None]
+    :param Xs: A list of sparse model matrices per likelihood parameter. Can contain None for
+        indices for which model matrix should not be formed explicitly.
+    :type Xs: list[scp.sparse.csc_array | np.ndarray | DiscreteModelMatrix | None]
+    """
+    if fam.fast_hmp is False:
+        raise ValueError(
+            "Event probabilities can only be extracted for fast HMP models."
+        )
+    # Extract families, transition matrices, etc.
+    n_S = fam.llkargs[0]
+    obs_fams = fam.llkargs[1]
+    d_fams = fam.llkargs[2]
+    D = fam.llkargs[5]
+    M = fam.llkargs[6]
+    starts_with_first = fam.llkargs[7]
+    build_mat_idx = fam.llkargs[11]
+    shared_pars = fam.llkargs[12]
+    shared_m = fam.llkargs[13]
+    T = fam.llkargs[14]
+    pi = fam.llkargs[15]
+    scale = fam.llkargs[17]
+    event_template = fam.llkargs[18]
+    hmp_fam = fam.llkargs[19]
+    is_hmp = fam.is_hmp
+    fix_T_pi = fam.fix_T_pi
+    tvdtpi = fam.tvdtpi
+
+    flats = None
+    rho = None
+
+    # Extract some extra info and define storage
+    n_T = len(ys[0])  # Number of time-points in this series
+    event_width = None if event_template is None else len(event_template)
+
+    # We can pre-compute the bs and ds - i.e., observation probabilities and
+    # duration probabilities
+    cross_corr, mus, _, _, _, bs, ds, Ts, pis = _compute_series_probs(
+        coef,
+        coef_split_idx,
+        shared_pars,
+        fam.shared_j,
+        shared_m,
+        ys,
+        Xs,
+        n_S,
+        obs_fams,
+        d_fams,
+        D,
+        M,
+        event_width,
+        event_template,
+        scale,
+        False,
+        False if fix_T_pi else True,
+        False if fix_T_pi else True,
+        starts_with_first,
+        build_mat_idx,
+        is_hmp,
+        hmp_fam,
+        rho,
+        tvdtpi,
+        fam.fast_hmp,
+        False,
+        flats,
+    )
+
+    ds[np.isnan(ds) | np.isinf(ds)] = 0
+
+    # The following computes the forward and backward variables of a HMP model as described by
+    # Weindel, van Maanen and Borst (2024) and then uses these to compute the event probabilities.
+    # Code taken & modified from:
+    # https://github.com/GWeindel/hmp/blob/devel/hmp/models/event.py
+
+    n_events = (n_S - 1) // 2
+    n_events_full = n_events
+    n_flats = n_events + 1
+    gains = np.zeros((n_T, n_events), dtype=np.float64)
+
+    for i in range(cross_corr.shape[1]):
+        # computes the gains, i.e. the log of the likelihood ratio between
+        # event present and absent.
+        gains = gains + cross_corr[:, [i]] * mus[:, i, :] - mus[:, i, :] ** 2 / scale
+    gains = np.exp(gains)
+    gains_b = gains[::-1, ::-1]
+
+    # pmf for each flat with appropriate zeroing to prevent overlap between events
+    pmf = np.zeros([n_T, n_flats], dtype=np.float64)
+    end = min(n_T, D - 1)
+
+    # Figure out which transitions are actually happening on this trial.
+    # Needs translation from bump/flat world to event/stage world.
+    n_events, events, stages, bumps, flats = fam._group_hmp_events(series)
+
+    # Handle first stage here, rest in loop over transitions below
+    pmf[:end, stages[0]] = ds[:end, stages[0]]
+    pmf[: fam.hmp_location[stages[0]], stages[0]] = 0
+
+    # Loop over transitions
+    for stage in stages[1:]:
+        pmf[:end, stage] = ds[:end, stage]
+        pmf[: fam.hmp_location[stage], stage] = 0
+    pmf_b = pmf[:, ::-1]
+
+    # Now modified forward pass
+    forward = np.zeros((n_T, n_events), dtype=np.float64)
+    backward = np.zeros((n_T, n_events), dtype=np.float64)
+    forward[:, 0] = pmf[:, stages[0]] * gains[:, events[0]]
+    backward[:, 0] = pmf_b[:, stages[0]]
+
+    for evidx in np.arange(1, n_events):
+        # convolution between pmf and previous forward multiplied by gain
+        forward[:, evidx] = (
+            np.convolve(forward[:, evidx - 1], pmf[:, stages[evidx]])[:n_T]
+            * gains[:, events[evidx]]
+        )
+        backward[:, evidx] = np.convolve(
+            backward[:, evidx - 1] * gains_b[:, events[evidx - 1]],
+            pmf_b[:, stages[evidx]],
+        )[:n_T]
+
+    # Revert backward variable
+    backward = backward[:, ::-1]
+    backward = backward[::-1, :]
+
+    # Compute event_probs
+    event_probs = forward * backward
+    event_probs = np.clip(event_probs, 0, None)
+    event_probs = event_probs / event_probs.sum(axis=0)
+    event_probs[np.isnan(event_probs)] = 0
+
+    # And embed in n_events_full columns
+    event_probs_full = np.zeros((n_T, n_events_full), dtype=np.float64)
+    event_probs_full[:, events] = event_probs
+
+    return event_probs_full
+
+
+def get_hmp_event_probs(
+    fam: HSMMFamily,
+    coef: np.ndarray,
+    coef_split_idx: list[int],
+    ys: list[np.ndarray | None],
+    Xs: list[scp.sparse.csc_array | np.ndarray | DiscreteModelMatrix | None],
+) -> np.ndarray:
+    """Computes the probability of each event at every time-point for every trial.
+
+    :param fam: Family of the model
+    :type fam: HSMMFamily
+    :param coef: The current coefficient estimate (as np.array of shape (-1,1) - so it must not
+        be flattened!).
+    :type coef: np.ndarray
+    :param coef_split_idx: A list used to split (via :func:`np.split`) the ``coef`` into the
+        sub-sets associated with each paramter of the llk.
+    :type coef_split_idx: list[int]
+    :param ys: List containing the vectors of observations (each of shape (-1,1)) passed as
+        ``lhs.variable`` to the formulas. **Note**: by convention ``mssm`` expectes that the
+        actual observed data is passed along via the first formula (so it is stored in
+        ``ys[0]``). If multiple formulas have the same ``lhs.variable`` as this first formula,
+        then ``ys`` contains ``None`` at their indices to save memory.
+    :type ys: [np.ndarray or None]
+    :param Xs: A list of sparse model matrices per likelihood parameter. Can contain None for
+        indices for which model matrix should not be formed explicitly.
+    :type Xs: list[scp.sparse.csc_array | np.ndarray | DiscreteModelMatrix | None]
+    """
+    if fam.fast_hmp is False:
+        raise ValueError(
+            "Event probabilities can only be extracted for fast HMP models."
+        )
+    # Extract families, transition matrices, etc.
+    n_S = fam.llkargs[0]
+    obs_fams = fam.llkargs[1]
+    d_fams = fam.llkargs[2]
+    sid = fam.llkargs[3]
+    tid = fam.llkargs[4]
+    M = fam.llkargs[6]
+    starts_with_first = fam.llkargs[7]
+    shared_pars = fam.llkargs[12]
+    shared_m = fam.llkargs[13]
+    Lrhoi = fam.llkargs[16]
+
+    n_series = len(sid)
+    fix_T_pi = fam.fix_T_pi
+
+    # Initialize potential None arguments
+    if tid is None:
+        tid = sid
+
+    # Split up ys, Xs
+    split_Ys, split_Xs, _ = _split_matrices(
+        fam.cross_cor,
+        Xs,
+        shared_pars,
+        shared_m,
+        obs_fams,
+        d_fams,
+        sid,
+        tid,
+        n_S,
+        M,
+        False if fix_T_pi else True,
+        False if fix_T_pi else True,
+        starts_with_first,
+        None if fam.fast_hmp else Lrhoi,
+    )
+
+    max_len = np.max([len(split_Ys[series][0]) for series in range(n_series)])
+
+    # Now compute event probabilities
+    ev_probs = []
+    for series in range(n_series):
+        with warnings.catch_warnings():  # Supress warnings
+            warnings.simplefilter("ignore")
+            ev_probss = get_hmp_event_probs_series(
+                fam,
+                series,
+                coef,
+                coef_split_idx,
+                split_Ys[series],
+                split_Xs[series],
+            )
+
+            # Embed into max len
+            ev_probss = np.vstack(
+                (
+                    ev_probss,
+                    np.zeros((max_len - ev_probss.shape[0], ev_probss.shape[1])),
+                )
+            )
+
+            ev_probs.append(ev_probss)
+
+    return np.array(ev_probs)
+
+
+def simulateSources(
     sources,
     n_trials,
     n_jobs,
@@ -87,8 +359,8 @@ def simulate(
     """
     Simulates n_trials of EEG and/or MEG using MNE's tools based on the specified sources
 
-    Taken from the hmp code and adapted slightly to permit simulating non-linear covariate effects
-    on expected flat durations.
+    Taken from the hmp code and adapted slightly to permit simulating non-linear covariate +
+    random effects on the amplitude of each event and the expected flat durations.
 
     References:
      - hmp code, see https://github.com/GWeindel/hmp/blob/devel/hmp/simulations.py#L51 (might have\
@@ -258,7 +530,11 @@ def simulate(
             # Fake source, actually stimulus onset
             selected_label = mne.read_labels_from_annot(
                 subject,
-                regexp=sources_subj[0][0],
+                regexp=(
+                    sources_subj[0][0][0]
+                    if isinstance(sources_subj[0][0], list)
+                    else sources_subj[0][0]
+                ),
                 subjects_dir=subjects_dir,
                 verbose=verbose,
             )[0]
@@ -274,27 +550,7 @@ def simulate(
             trigger = 2
             generating_events = events
             for s, source in enumerate(sources_subj):
-                if trigger == len(sources_subj) + 1:
-                    source[2] = (
-                        1e-20  # Last source defines RT and is not an event per se
-                    )
-                selected_label = mne.read_labels_from_annot(
-                    subject,
-                    regexp=source[0],
-                    subjects_dir=subjects_dir,
-                    verbose=verbose,
-                )[0]
-                label = mne.label.select_sources(
-                    subject,
-                    selected_label,
-                    subjects_dir=subjects_dir,
-                    location=0,
-                    grow_outside=False,
-                    random_state=random_state,
-                )
-                # last two parameters ensure sources that are different enough
-                # Define the time course of the activity for each source of the region to
-                # activate
+
                 if event_length_samples is None:
                     event_duration = int(((1 / source[1]) / 2) * info["sfreq"])
                     # Shift the trigger for the simulations
@@ -304,10 +560,6 @@ def simulate(
                     # Assumes the shortest event duration is a half-sine
                     shift = min(event_length_samples) // 2
 
-                source_time_series = (
-                    event_shape(info["sfreq"], event_duration * 1000 / info["sfreq"])
-                    * source[2]
-                )
                 # adding source event, take as previous time the event defined by relation (default
                 # is previous event)
                 events = generating_events[
@@ -333,14 +585,72 @@ def simulate(
                     events[random_indices, 0] + rand_i[random_indices]
                 )  # Events sample.
                 events[:, 2] = trigger  # All events have the sample id.
-                trigger += 1
+
                 generating_events = np.concatenate([generating_events, events.copy()])
                 # Shift event to onset when simulating pattern
                 events[random_indices, 0] = events[random_indices, 0] - shift
                 # add these events
-                source_simulator.add_data(
-                    label, source_time_series, events[random_indices]
+
+                source_it = (
+                    range(len(source[0])) if isinstance(source[0], list) else range(1)
                 )
+                for source_idx in source_it:
+                    target_source = (
+                        source[0][source_idx]
+                        if isinstance(source[0], list)
+                        else source[0]
+                    )
+                    # print(s, target_source)
+                    selected_label = mne.read_labels_from_annot(
+                        subject,
+                        regexp=target_source,
+                        subjects_dir=subjects_dir,
+                        verbose=verbose,
+                    )[0]
+                    label = mne.label.select_sources(
+                        subject,
+                        selected_label,
+                        subjects_dir=subjects_dir,
+                        location=0,
+                        grow_outside=False,
+                        random_state=random_state,
+                    )
+                    # last two parameters ensure sources that are different enough
+                    # Define the time course of the activity for each source of the region to
+                    # activate
+
+                    amplitude = (
+                        source[2][source_idx]
+                        if isinstance(source[0], list)
+                        else source[2]
+                    )
+
+                    if trigger == len(sources_subj) + 1:
+                        amplitude = (
+                            1e-20  # Last source defines RT and is not an event per se
+                        )
+
+                    if isinstance(amplitude, np.ndarray):
+                        if len(amplitude.shape) == 1:
+                            amplitude = amplitude.reshape(-1, 1)
+                        source_time_series = (
+                            event_shape(
+                                info["sfreq"], event_duration * 1000 / info["sfreq"]
+                            ).reshape(1, -1)
+                            * amplitude
+                        )
+                    else:
+                        source_time_series = (
+                            event_shape(
+                                info["sfreq"], event_duration * 1000 / info["sfreq"]
+                            )
+                            * amplitude
+                        )
+
+                    source_simulator.add_data(
+                        label, source_time_series, events[random_indices]
+                    )
+                trigger += 1
 
             generating_events = generating_events[generating_events[:, 0].argsort()]
             # Project the source time series to sensor space and add some noise. The source
@@ -399,6 +709,653 @@ def simulate(
     if n_subj == 1:
         files = files[0]
     return files
+
+
+def sim6(
+    n_events: int,
+    n_participants: int,
+    n_trials: int,
+    source_names: list[str],
+    mus: list[float],  # Means of the gamma distribution
+    scale: float = 0.5,
+    s_scale: float = 0.5,
+    frequency: float = 10.0,  # Frequency of the event defining its duration, half-sine of 10Hz
+    base_amplitude: float = 0.2e-7,
+    seed: int | None = 2026,
+    sfreq: int = 100,
+    cpus: int = 1,
+    file: str = "dataset_raw",
+):
+    # Generate sources
+    sources = []
+    xs = []
+    true_durs = np.zeros((n_events + 1, n_participants, n_trials))
+
+    # Simulate effect of x on expected duration of each stage
+    np_gen = np.random.default_rng(seed)
+
+    source_seed = seed
+    for participant in range(n_participants):
+        # Generate covariates influencing events
+        x = np.sort(np_gen.random(size=n_trials))
+
+        xs.append(x)
+        sources.append([])
+
+        # sources are mixtured
+        for si, names in enumerate(source_names):
+
+            if si < n_events:
+
+                n_classes = len(names)
+                sim_dat = sim18(5000, 2, c=0, seed=10, correlate=False, n_ranef=2)
+
+                sim_dat.loc[:, "y"] = np_gen.integers(
+                    0, high=n_classes, size=sim_dat.shape[0]
+                )
+
+                sim_formulas = []
+                for k in range(n_classes - 1):
+                    terms = [i(), f(["x0"])]
+                    sim_formulas.append(Formula(lhs("y"), terms, data=sim_dat))
+
+                model = GAMMLSS(sim_formulas, MULNOMLSS(n_classes - 1))
+                model.fit(method="Chol", progress_bar=False)
+
+                for lam in model.overall_penalties:
+                    lam.lam = s_scale
+
+                S_emb, _, _, _ = compute_S_emb_pinv_det(
+                    model.coef.shape[0], model.overall_penalties, "svd", root=False
+                )
+
+                eigV, U = scp.linalg.eigh(S_emb.toarray())
+
+                # Enforce PSD
+                eigV[eigV < 1e-7] = 0
+                ieigV = np.zeros_like(eigV)
+                ieigV[eigV > 0] = np.sqrt(1 / eigV[eigV > 0])
+
+                # Get root
+                lvi = np.diag(ieigV) @ U.T
+                model.lvi = lvi
+
+                coefs = []
+                for par in range(n_classes - 1):
+                    coef_par = model.sample_post(
+                        1, par=par, deviations=True, seed=source_seed
+                    )
+                    coefs.append(coef_par)
+                coefs = np.concatenate(coefs, axis=0)
+
+                model.coef = coefs
+                pred_dat = pd.DataFrame({"x0": x, "x1": x, "x2": x, "x3": x})
+                pmus = []
+                for k in range(n_classes - 1):
+
+                    eta, _, _ = model.predict([0, 1], pred_dat, ci=False, par=k)
+                    mu = model.family.links[k].fi(eta)
+                    pmus.append(mu.reshape(-1, 1))
+
+                probs = model.family.get_probs(*pmus)
+
+                amplitudes = []
+                for k in range(n_classes):
+                    plt.plot(probs[:, k])
+                    sign = np_gen.random()
+                    if sign < 0.5:
+                        sign = -1
+                    else:
+                        sign = 1
+                    amplitudes.append(sign * base_amplitude * probs[:, k])
+                plt.show()
+            else:
+                amplitudes = 1e-7
+
+            # Now stage durations
+            alpha = 1 / scale
+            beta = alpha / mus[si]
+
+            # duration samples
+            dur = scp.stats.gamma.rvs(
+                a=alpha,
+                scale=(1 / beta),
+                size=n_trials,
+                random_state=seed + participant,
+            )
+
+            dur[dur < 50] = 70
+
+            true_durs[si, participant, :] = dur
+
+            sources[-1].append([names, frequency, amplitudes, dur])
+            source_seed += 1
+
+    # Function used to generate the data
+    file = simulateSources(
+        sources,
+        n_trials,
+        cpus,
+        file,
+        n_subj=n_participants,
+        overwrite=True,
+        sfreq=sfreq,
+        seed=seed,
+        path="./",
+    )
+    return true_durs, xs, file
+
+
+def sim5(
+    n_events: int,
+    n_participants: int,
+    n_trials: int,
+    source_names: list[str],
+    mus: list[float],  # Means of the gamma distribution
+    scale: float = 0.5,
+    fs_scale: float = 0,
+    frequency: float = 10.0,  # Frequency of the event defining its duration, half-sine of 10Hz
+    base_amplitude: float = 0.2e-7,
+    seed: int | None = 2026,
+    sfreq: int = 100,
+    cpus: int = 1,
+    force_group_level: bool = False,
+    prevent_sign_flip: bool = False,
+    file: str = "dataset_raw",
+):
+    # Generate sources
+    sources = []
+    xs = []
+    true_durs = np.zeros((n_events + 1, n_participants, n_trials))
+
+    # Simulate effect of x on expected duration of each stage
+    np_gen = np.random.default_rng(seed)
+
+    # Set up random smooth sampler
+    c = max(1e-7, fs_scale)
+
+    # Set up random smooth sampler for smooth of x0
+    # Based on prior assumption discussed by Wood (2017)
+    x = np_gen.random(size=1000)
+    fs_dat = pd.DataFrame({"x": x, "y": np_gen.random(1000)})
+
+    fs_formula = Formula(
+        lhs=lhs("y"),
+        terms=[
+            f(
+                ["x"],
+                identifiable=False,
+                nk=10,
+                penalty=[DifferencePenalty()],
+                pen_kwargs=[{"m": 1}],
+            )
+        ],
+        data=fs_dat,
+    )
+
+    fs_model = GAMM(fs_formula, Gaussian())
+    fs_pen = build_penalties(fs_formula)
+
+    mmat = fs_model.get_mmat()
+    fs_model.coef = np_gen.random(mmat.shape[1]).reshape(-1, 1)
+    cov = fs_formula.cov_flat
+    S = fs_pen[0].S_J
+
+    C, Srp, Drp, IRrp, rms1, rms2, rp_rank = reparam(
+        mmat, S, cov, identity=True, scale=False, QR=True
+    )
+
+    pred_dat = pd.DataFrame({"x": np.linspace(0, 1, 30)})
+    _, pred_mat, _ = fs_model.predict(None, n_dat=pred_dat)
+    pred_mat = pred_mat @ C
+    pred_mat[:, [-1]] = 1
+    etas = np.zeros((n_participants, n_events, 30))
+
+    V = (Srp / (c * 1e7)).toarray()
+    source_seed = seed
+    for participant in range(n_participants):
+        # Generate covariates influencing events
+        x = np_gen.random(size=n_trials)
+
+        # Get prediction matrix for this participant
+        pred_dat = pd.DataFrame({"x": x})
+        _, mmat, _ = fs_model.predict(None, n_dat=pred_dat)
+        mmat_RP = mmat @ C
+        mmat_RP[:, [-1]] = 1
+
+        xs.append(x)
+        sources.append([])
+
+        # per source we have multiple amplitudes (one for each trial)
+        for si, name in enumerate(source_names):
+
+            # Sample random smooth for this participant and source
+            sample = scp.stats.multivariate_normal.rvs(
+                mean=[0 for _ in range(Srp.shape[1])],
+                cov=V,
+                size=1,
+                random_state=source_seed,
+            )
+            eta = mmat_RP @ sample
+
+            if si < n_events:
+                etas[participant, si, :] = pred_mat @ sample
+
+            if force_group_level:
+                eta = 0.9
+                etas[participant, :, :] = 0.9
+            elif si < n_events and prevent_sign_flip:
+                direction = np_gen.random()
+                step = 0.1
+                if direction < 0.5:
+                    while np.any((0.1 + eta) >= 0):
+                        eta -= step
+                        etas[participant, si, :] -= step
+                else:
+                    while np.any((0.1 + eta) <= 0):
+                        eta += step
+                        etas[participant, si, :] += step
+                # plt.plot(etas[participant, si, :] + 0.1)
+            amplitude = base_amplitude * (0.1 + eta)
+
+            # Now stage durations
+            alpha = 1 / scale
+            beta = alpha / mus[si]
+
+            # duration samples
+            dur = scp.stats.gamma.rvs(
+                a=alpha,
+                scale=(1 / beta),
+                size=n_trials,
+                random_state=seed + participant,
+            )
+
+            dur[dur < 50] = 70
+
+            true_durs[si, participant, :] = dur
+
+            sources[-1].append([name, frequency, amplitude, dur])
+            source_seed += 1
+        # plt.show()
+
+    # Function used to generate the data
+    file = simulateSources(
+        sources,
+        n_trials,
+        cpus,
+        file,
+        n_subj=n_participants,
+        overwrite=True,
+        sfreq=sfreq,
+        seed=seed,
+        path="./",
+    )
+    return true_durs, etas, xs, file
+
+
+def sim4(
+    n_events: int,
+    n_participants: int,
+    n_trials: int,
+    source_names: list[str],
+    mus: list[float],  # Means of the gamma distribution
+    scale: float = 0.5,
+    fs_scale: float = 0,
+    frequency: float = 10.0,  # Frequency of the event defining its duration, half-sine of 10Hz
+    base_amplitude: float = 0.2e-7,
+    seed: int | None = 2026,
+    sfreq: int = 100,
+    cpus: int = 1,
+    force_group_level: bool = False,
+    file: str = "dataset_raw",
+):
+    # Generate sources
+    sources = []
+    xs = []
+    true_durs = np.zeros((n_events + 1, n_participants, n_trials))
+
+    # Simulate effect of x on expected duration of each stage
+    np_gen = np.random.default_rng(seed)
+
+    # Set up random smooth sampler
+    c = max(1e-7, fs_scale)
+
+    # Set up random smooth sampler for smooth of x0
+    # Based on prior assumption discussed by Wood (2017)
+    x = np_gen.random(size=1000)
+    fs_dat = pd.DataFrame({"x": x, "y": np_gen.random(1000)})
+
+    fs_formula = Formula(
+        lhs=lhs("y"),
+        terms=[
+            f(
+                ["x"],
+                identifiable=False,
+                nk=10,
+                penalty=[DifferencePenalty()],
+                pen_kwargs=[{"m": 1}],
+            )
+        ],
+        data=fs_dat,
+    )
+
+    fs_model = GAMM(fs_formula, Gaussian())
+    fs_pen = build_penalties(fs_formula)
+
+    mmat = fs_model.get_mmat()
+    fs_model.coef = np_gen.random(mmat.shape[1]).reshape(-1, 1)
+    cov = fs_formula.cov_flat
+    S = fs_pen[0].S_J
+
+    C, Srp, Drp, IRrp, rms1, rms2, rp_rank = reparam(
+        mmat, S, cov, identity=True, scale=False, QR=True
+    )
+
+    V = (Srp / (c * 1e7)).toarray()
+
+    for participant in range(n_participants):
+        # Generate covariates influencing events
+        x = np_gen.random(size=n_trials)
+
+        # Get prediction matrix for this participant
+        pred_dat = pd.DataFrame({"x": x})
+        _, mmat, _ = fs_model.predict(None, n_dat=pred_dat)
+        mmat_RP = mmat @ C
+        mmat_RP[:, [-1]] = 1
+
+        # Sample random smooth for this participant
+        sample = scp.stats.multivariate_normal.rvs(
+            mean=[0 for _ in range(Srp.shape[1])],
+            cov=V,
+            size=1,
+            random_state=seed + participant,
+        )
+        eta = mmat_RP @ sample
+
+        if force_group_level:
+            eta = 0.9
+
+        xs.append(x)
+        sources.append([])
+
+        # per source we have multiple amplitudes (one for each trial)
+        for si, name in enumerate(source_names):
+
+            amplitude = base_amplitude * (0.1 + eta)
+
+            # Now stage durations
+            alpha = 1 / scale
+            beta = alpha / mus[si]
+
+            # duration samples
+            dur = scp.stats.gamma.rvs(
+                a=alpha,
+                scale=(1 / beta),
+                size=n_trials,
+                random_state=seed + participant,
+            )
+
+            dur[dur < 50] = 70
+
+            true_durs[si, participant, :] = dur
+
+            sources[-1].append([name, frequency, amplitude, dur])
+
+    # Function used to generate the data
+    file = simulateSources(
+        sources,
+        n_trials,
+        cpus,
+        file,
+        n_subj=n_participants,
+        overwrite=True,
+        sfreq=sfreq,
+        seed=seed,
+        path="./",
+    )
+    return true_durs, xs, file
+
+
+def sim3(
+    n_events: int,
+    n_participants: int,
+    n_trials: int,
+    source_names: list[str],
+    mus: list[float],  # Means of the gamma distribution
+    scale: float = 0.5,
+    rint_scale: float = 1,
+    frequency: float = 10.0,  # Frequency of the event defining its duration, half-sine of 10Hz = 50ms
+    base_amplitude: float = 0.2e-7,
+    seed: int | None = 2026,
+    sfreq: int = 100,
+    cpus: int = 1,
+    force_group_level: bool = False,
+    file: str = "dataset_raw",
+):
+    # Generate sources
+    sources = []
+    xs = []
+    true_durs = np.zeros((n_events + 1, n_participants, n_trials))
+
+    # Simulate effect of x on expected duration of each stage
+    np_gen = np.random.default_rng(seed)
+
+    # Simulate random intercepts
+    rind = scp.stats.norm.rvs(size=n_participants, scale=rint_scale, random_state=seed)
+
+    for participant in range(n_participants):
+        # Generate covariates influencing events
+        x = np_gen.random(size=n_trials)
+        xs.append(x)
+        sources.append([])
+
+        # per source we have multiple amplitudes (one for each trial)
+        for si, name in enumerate(source_names):
+
+            # Get event specific amplitude for each trial. Functions from Gu & Whaba (1991)
+            # "Minimizing GCV/GML Scores with Multiple Smoothing Parameters via the Newton Method"
+            if si == 0:
+                fv = 2 * np.sin(np.pi * x)
+                fv -= 1.5
+            elif si == 1:
+                fv = np.exp(2 * x)
+                fv -= 3.5
+            elif si == 2:
+                fv = 0.2 * np.power(x, 11) * np.power(10 * (1 - x), 6) + 10 * np.power(
+                    10 * x, 3
+                ) * np.power(1 - x, 10)
+                fv -= 3.5
+            else:
+                fv = np.zeros_like(x)
+
+            eta = fv + rind[participant]
+            if force_group_level:
+                eta = 0.9
+            amplitude = base_amplitude * (0.1 + eta)
+
+            # Now stage durations
+            alpha = 1 / scale
+            beta = alpha / mus[si]
+
+            # duration samples
+            dur = scp.stats.gamma.rvs(
+                a=alpha,
+                scale=(1 / beta),
+                size=n_trials,
+                random_state=seed + participant,
+            )
+
+            dur[dur < 50] = 70
+
+            true_durs[si, participant, :] = dur
+
+            sources[-1].append([name, frequency, amplitude, dur])
+
+    # Function used to generate the data
+    file = simulateSources(
+        sources,
+        n_trials,
+        cpus,
+        file,
+        n_subj=n_participants,
+        overwrite=True,
+        sfreq=sfreq,
+        seed=seed,
+        path="./",
+    )
+    return true_durs, xs, file
+
+
+def sim2(
+    n_events: int,
+    n_participants: int,
+    n_trials: int,
+    source_names: list[str],
+    mus: list[float],  # Means of the gamma distribution
+    scale: float = 0.5,
+    rint_scale: float = 1,
+    frequency: float = 10.0,  # Frequency of the event defining its duration, half-sine of 10Hz = 50ms
+    base_amplitude: float = 0.2e-7,
+    seed: int | None = 2026,
+    sfreq: int = 100,
+    cpus: int = 1,
+    force_group_level: bool = False,
+    file: str = "dataset_raw",
+):
+    # Generate sources
+    sources = []
+    xs = []
+    true_durs = np.zeros((n_events + 1, n_participants, n_trials))
+
+    # Simulate effect of x on expected duration of each stage
+    np_gen = np.random.default_rng(seed)
+
+    # Simulate random intercepts
+    rind = scp.stats.norm.rvs(size=n_participants, scale=rint_scale, random_state=seed)
+
+    for participant in range(n_participants):
+        # Generate covariates influencing events
+        x = np_gen.random(size=n_trials)
+        xs.append(x)
+        sources.append([])
+
+        # per source we have multiple amplitudes (one for each trial)
+        for si, name in enumerate(source_names):
+
+            # Get event shared amplitude for each trial. Function is from Gu & Whaba (1991)
+            # "Minimizing GCV/GML Scores with Multiple Smoothing Parameters via the Newton Method"
+
+            fv = 2 * np.sin(np.pi * x)
+            fv -= 1.5
+
+            eta = fv + rind[participant]
+            if force_group_level:
+                eta = 0.9
+            amplitude = base_amplitude * (0.1 + eta)
+
+            # Now stage durations
+            alpha = 1 / scale
+            beta = alpha / mus[si]
+
+            # duration samples
+            dur = scp.stats.gamma.rvs(
+                a=alpha,
+                scale=(1 / beta),
+                size=n_trials,
+                random_state=seed + participant,
+            )
+
+            dur[dur < 50] = 70
+
+            true_durs[si, participant, :] = dur
+
+            sources[-1].append([name, frequency, amplitude, dur])
+
+    # Function used to generate the data
+    file = simulateSources(
+        sources,
+        n_trials,
+        cpus,
+        file,
+        n_subj=n_participants,
+        overwrite=True,
+        sfreq=sfreq,
+        seed=seed,
+        path="./",
+    )
+    return true_durs, xs, file
+
+
+def sim1(
+    n_events: int,
+    n_trials: int,
+    source_names: list[str],
+    scale: float = 0.5,
+    frequency: float = 10.0,  # Frequency of the event defining its duration, half-sine of 10Hz = 50ms
+    amplitude: float = 0.2e-7,
+    seed: int | None = 2026,
+    sfreq: int = 100,
+    cpus: int = 1,
+    file: str = "dataset_raw",
+):
+    # Generate sources
+    sources = []
+    true_durs = np.zeros((n_events + 1, n_trials))
+
+    # Simulate effect of x on expected duration of each stage
+    np_gen = np.random.default_rng(seed)
+
+    x = np_gen.random(size=n_trials)
+    gam_dat = pd.DataFrame({"x": x})
+
+    # One source = one frequency, one amplitude and a given by-trial variability distribution
+    for si, name in enumerate(source_names):
+
+        # Get mean of stage-specific Gamma distribution. Functions from Gu & Whaba (1991)
+        # "Minimizing GCV/GML Scores with Multiple Smoothing Parameters via the Newton Method"
+        if si == 0:
+            fv = 0.5 * np.sin(np.pi * x) + 5
+        elif si == 1:
+            fv = 0.05 * np.exp(2 * x) + 5
+        elif si == 2:
+            fv = (
+                0.2 * np.power(x, 11) * np.power(10 * (1 - x), 6)
+                + 10 * np.power(10 * x, 3) * np.power(1 - x, 10)
+            ) * 0.2 + 5
+        else:
+            fv = np.zeros_like(x) + 5
+
+        mu = Gamma().link.fi(fv)
+
+        # Convert to parameters scipy expects
+        alpha = 1 / scale
+        beta = alpha / mu
+
+        # duration samples
+        dur = scp.stats.gamma.rvs(
+            a=alpha, scale=(1 / beta), size=n_trials, random_state=seed
+        )
+
+        dur[dur < 50] = 70
+
+        # Collect durations
+        true_durs[si, :] = dur
+        gam_dat[f"durs_{si}"] = dur
+
+        sources.append([name, frequency, amplitude, dur])
+
+    # Function used to generate the data
+    file = simulateSources(
+        sources,
+        n_trials,
+        cpus,
+        file,
+        overwrite=True,
+        sfreq=sfreq,
+        seed=seed,
+        path="./",
+    )
+    return true_durs, x, file
 
 
 class GAMMA2(GAMLSSFamily):
@@ -612,9 +1569,9 @@ class GAMMA2(GAMLSSFamily):
         :return: A numpy array of shape (-1,1), holding initial values for all model coefficients.
         :rtype: np.ndarray
         """
-
+        return None
         mean_model = models[0]
-        mean_model.family = Gamma(self.links[0])
+        mean_model.family = Gamma(self.links[0], scale=0.5)
         mean_model.fit(progress_bar=False, max_inner=1)
 
         m_coef, _ = mean_model.get_pars()
@@ -635,6 +1592,7 @@ def init_hmp(
     offset_d: int = 5,
     should_plot: bool = False,
     should_init_durs: bool = True,
+    axs: list[matplotlib.axes._axes.Axes] | None = None,
 ) -> tuple[np.ndarray, list[float]]:
     """Initializes a HMP-like HSMM based on (random) state estimates.
 
@@ -727,10 +1685,12 @@ def init_hmp(
     Lrhoi = fam.llkargs[16]
     scale = fam.llkargs[17]
     n_series = len(sid)
+    event_template = fam.llkargs[18]
+    event_width = len(event_template)
 
     # Split up ys, Xs
-    split_Ys, _ = _split_matrices(
-        ys,
+    split_Ys, _, _ = _split_matrices(
+        ys if fam.fast_hmp is False else fam.cross_cor,
         Xs,
         shared_pars,
         shared_m,
@@ -743,7 +1703,7 @@ def init_hmp(
         False,
         False,
         starts_with_first,
-        Lrhoi,
+        None if fam.fast_hmp else Lrhoi,
     )
 
     np_gen = np.random.default_rng(seed)
@@ -756,10 +1716,7 @@ def init_hmp(
 
             for series in range(n_series):
                 statess, durss = rand_init_series(
-                    [
-                        y_split[series] if y_split is not None else None
-                        for y_split in split_Ys
-                    ],
+                    split_Ys[series],
                     n_S,
                     D,
                     rand_init,
@@ -772,13 +1729,7 @@ def init_hmp(
         else:  # Compute in parallel
 
             args = zip(
-                [
-                    [
-                        y_split[series] if y_split is not None else None
-                        for y_split in split_Ys
-                    ]
-                    for series in range(n_series)
-                ],
+                split_Ys,
                 repeat(n_S),
                 repeat(D),
                 repeat(rand_init),
@@ -806,6 +1757,13 @@ def init_hmp(
 
                 init_durs = pool.starmap(compute_durs_series, args)
 
+    for series in range(n_series):
+        for j in range(n_S):
+            if j % 2 == 1 and j in init_states[series]:
+                onset = np.argmin(np.abs(init_states[series] - j))
+                init_states[series][init_states[series] == j] = -1
+                init_states[series][onset + event_width // 2] = j
+
     init_states = np.concatenate(init_states)
     init_durs = np.concatenate(init_durs, axis=0)
 
@@ -813,6 +1771,7 @@ def init_hmp(
     init_coef = []
     init_lambda = []
     ofidx = 0
+    axi = 0
     for j in range(n_S):
 
         for m in range(M):
@@ -828,7 +1787,7 @@ def init_hmp(
                 init_j_model = GAMM(init_j_form, Gaussian(scale=scale))
                 init_j_model.fit(progress_bar=False)
 
-                if should_plot:
+                if should_plot and len(obs_form.smooth_terms) > 0:
                     plot(init_j_model)
 
                 init_coef.extend(init_j_model.coef.flatten())
@@ -872,7 +1831,11 @@ def init_hmp(
 
                     if should_plot:
                         for par in range(d_fam.n_par):
-                            plot(init_j_model, dist_par=par)
+                            plot(
+                                init_j_model,
+                                dist_par=par,
+                                axs=([axs[axi]] if axs is not None else None),
+                            )
 
                 except:  # noqa
                     GAMM_Fam = (
@@ -884,7 +1847,9 @@ def init_hmp(
                     init_j_model = GAMM(d_forms[0], GAMM_Fam)
                     init_j_model.fit(progress_bar=False)
                     if should_plot:
-                        plot(init_j_model)
+                        plot(
+                            init_j_model, axs=([axs[axi]] if axs is not None else None)
+                        )
 
                     # print(init_j_model.coef,init_j_model.scale)
                     init_coef.extend(init_j_model.coef.flatten())
@@ -905,6 +1870,7 @@ def init_hmp(
                     init_lambda.extend(
                         [1 for _ in range(len(build_penalties(d_forms[1])))]
                     )
+                axi += 1
 
     return np.array(init_coef).reshape(-1, 1), init_lambda
 
@@ -979,7 +1945,7 @@ def advance_chain_hmp(
     d_fams: list,
     fam: HSMMFamily,
     coef: np.ndarray,
-    lam: np.ndarray,
+    init_lam: np.ndarray,
     coef_split_idx: list[int],
     formulas: list[Formula],
     Xs: list[scp.sparse.csc_array | None],
@@ -987,326 +1953,381 @@ def advance_chain_hmp(
     n_series: int,
     n_S: int,
     M: int,
-    Lrhoi: scp.sparse.csc_array | None,
     scale: float,
     starts_with_first: bool,
     event_template: np.ndarray,
-    n_cores_td=1,
-    n_cores_gammlss=1,
-    seed=0,
+    n_cores_td: int = 1,
+    n_cores_gammlss: int = 1,
+    seed: int | None = 0,
+    steps: int = 1,
+    sample_map: bool = False,
+    avg_e_terms: list = [],
 ):
     """Advances the chain of the Laplace approximate posterior sampler for a HMP model."""
+    T = fam.llkargs[14]
+    pi = fam.llkargs[15]
+    event_width = len(event_template)
+    np_gen = np.random.default_rng(seed)
+    # tiled_template = np.tile(event_template, n_series).reshape(-1, 1)
 
-    tiled_template = np.tile(event_template, n_series).reshape(-1, 1)
+    res_coef = np.zeros((len(coef), steps))
+    res_lam = np.zeros((len(init_lam), steps))
+    res_lp = np.zeros((1, steps))
 
-    # Sample state sequences given data and coefficients
-    state_samples = fam.sample_posterior_states(
-        coef,
-        coef_split_idx,
-        ys,
-        Xs,
-        n_samples=1,
-        seed=seed,
-    )
+    # Figure out dimension of shared coef
+    avg_j_dim = 0
+    if len(avg_e_terms) != 0:
+        for tidx in avg_e_terms:
+            avg_j_dim += len(formulas[0].coef_idx_per_term[tidx])
 
-    # Collect states and durs
-    states_flat = []
-    durs = []
-    transitions = []
-    total_transitions = []
-    init_js = []
-    state_args = []
-    ed_args = []
-    for series in range(n_series):
-        states_series = state_samples[series][1][:, 0]
-        ed_series = state_samples[series][0][0]
+    for step in range(steps):
+        # print(step)
 
-        if n_cores_td <= 1:
-            (
-                durs_series,
-                transitions_series,
-                total_transitions_series,
-                j_init_series,
-            ) = compute_durs_transitions_series(states_series, ed_series, n_S)
+        # Sample state sequences given data and coefficients
+        state_samples = fam.sample_posterior_states(
+            coef,
+            coef_split_idx,
+            ys,
+            Xs,
+            n_samples=1,
+            seed=seed,
+        )
 
-            durs.append(durs_series)
-            transitions.append(transitions_series)
-            total_transitions.append(total_transitions_series)
-            init_js.append(j_init_series)
-        else:
-            state_args.append(states_series)
-            ed_args.append(ed_series)
+        # Get corresponding model llk
+        state_lp = 0
 
-        states_flat.extend(states_series)
+        # Collect states and durs
+        states_flat = []
+        durs = []
+        transitions = []
+        total_transitions = []
+        init_js = []
+        state_args = []
+        ed_args = []
+        flats = []
+        for series in range(n_series):
+            states_series = state_samples[series][1][:, 0]
+            ed_series = state_samples[series][0][0]
 
-    # Compute durs and transitions in parallel
-    if n_cores_td > 1:
-        args = zip(state_args, ed_args, repeat(n_S))
+            if n_cores_td <= 1:
+                (
+                    durs_series,
+                    transitions_series,
+                    total_transitions_series,
+                    j_init_series,
+                ) = compute_durs_transitions_series(states_series, ed_series, n_S)
 
-        with mp.Pool(processes=n_cores_td) as pool:
-            durs, transitions, total_transitions, init_js = zip(
-                *pool.starmap(compute_durs_transitions_series, args)
-            )
+                durs.append(durs_series)
+                transitions.append(transitions_series)
+                total_transitions.append(total_transitions_series)
+                init_js.append(j_init_series)
+            else:
+                state_args.append(states_series)
+                ed_args.append(ed_series)
 
-    states_flat = np.array(states_flat)
+            if fam.hmp_d_offset:
+                _, _, _, _, flatss = fam._group_hmp_events(series)
+                flats.append(flatss)
 
-    # We will have to correct for the lag of the ar1 model when fitting the observation models
-    if Lrhoi is not None:
-        states_flat_ar = copy.deepcopy(states_flat)
-        state_idx = np.arange(len(states_flat))
+            for j in range(n_S):
+                if j % 2 == 1 and j in states_series:
+                    onset = np.argmin(np.abs(states_series - j))
+                    states_series[states_series == j] = -1
+                    states_series[onset + event_width // 2] = j
+
+            states_flat.extend(states_series)
+
+        # Compute durs and transitions in parallel
+        if n_cores_td > 1:
+            args = zip(state_args, ed_args, repeat(n_S))
+
+            with mp.Pool(processes=n_cores_td) as pool:
+                durs, transitions, total_transitions, init_js = zip(
+                    *pool.starmap(compute_durs_transitions_series, args)
+                )
+
+        states_flat = np.array(states_flat)
+
+        # Now estimate coef given states
+        next_coef = []
+        next_lam = []
+        idx = 0  # Keep track of indices for ys and Xs
+
+        # Emission coef
         for j in range(n_S):
+
             if j % 2 == 1:
-                states_flat_ar[state_idx[states_flat == j] + 1] = j
+                avg_j_indices = []
+                avg_j_coef = np.zeros(avg_j_dim)
+                avg_j_cov = np.zeros((avg_j_dim, avg_j_dim))
+                jcoef = []
 
-    # Now estimate coef given states
-    next_coef = []
-    next_lam = []
-    idx = 0  # Keep track of indices for ys and Xs
+                for m in range(M):
+                    # print(step, j, m)
+                    # Since we assume HMP/HSMMMVPA pattern for observation model family will be None
+                    # but we still need to compute models for bump states.
 
-    # Emission coef
-    for j in range(n_S):
+                    fJM = copy.deepcopy(formulas[idx])
 
-        iterM = M
+                    # print(chain_id, step, j, m, np.sum(states_flat == j) / 5)
+                    # print(j, np.sum(states_flat == j), tiled_template.shape[0])
 
-        for m in range(iterM):
-            # Since we assume HMP/HSMMMVPA pattern for observation model family will be None
-            # but we still need to compute models for bump states.
-            if j % 2 == 1:
+                    if np.sum(states_flat == j) == 0:
+                        jcoef.extend([np.nan for _ in range(formulas[idx].n_coef)])
 
-                fJM = copy.deepcopy(formulas[idx])
+                    else:
 
-                if (np.sum(states_flat == j) == 0) or (
-                    np.sum(states_flat == j) != len(tiled_template)
-                ):
+                        # Update data of formula
+                        tdat = fJM.data
 
-                    next_coef.extend([np.nan for _ in range(formulas[idx].n_coef)])
-
-                else:
-
-                    # Update data of formula
-                    tdat = fJM.data
-
-                    # Get model matrix
-                    XJM = build_model_matrix(fJM)
-
-                    # Model matrix needs to be multiplied by correct sine weight
-                    XJMdat, _, _ = translate_sparse(
-                        (XJM[states_flat == j, :] * tiled_template).tocsc()
-                    )
-                    XJMdat = np.array(XJMdat)
-
-                    # Correct for ar1 model of residuals
-                    if Lrhoi is not None:
-
-                        # Expected value of flats needs to be set to zero
-                        _, XJMrows, XJMcols = translate_sparse(XJM)
-                        XJMrows = np.array(XJMrows)
-
-                        keep = np.isin(
-                            XJMrows, np.arange(XJM.shape[0])[states_flat == j]
-                        )
-
-                        XJMrows = XJMrows[keep]
-                        XJMcols = np.array(XJMcols)[keep]
-
-                        XJM = scp.sparse.csc_array(
-                            (XJMdat, (XJMrows, XJMcols)), shape=XJM.shape
-                        )
-
-                        # Now can correct for ar1 process
-                        XJM = Lrhoi.T @ XJM
-
-                        # Y variable needs to hold (ar corrected) values as well...
-                        tdat.loc[:, fJM.lhs.variable] = Lrhoi.T @ tdat[
-                            fJM.lhs.variable
-                        ].values.reshape(-1, 1)
-
-                    # Only keep obs/rows related to current state
-                    if Lrhoi is None:
+                        # Only keep obs/rows related to current state
                         tdat = tdat.loc[states_flat == j, :]
-                        XJM = XJM[states_flat == j, :]
-                    else:
-                        tdat = tdat.loc[states_flat_ar == j, :]
-                        XJM = XJM[states_flat_ar == j, :]
-                    XJM.sort_indices()
 
-                    # Now update formula
-                    y_flat, cov_flat, NAs_flat, y, cov, NAs, sid = fJM.encode_data(tdat)
-
-                    # Store encoding
-                    fJM.y_flat = y_flat
-                    fJM.cov_flat = cov_flat
-                    fJM.NOT_NA_flat = NAs_flat
-                    fJM.y = y
-                    fJM.cov = cov
-                    fJM.NOT_NA = NAs
-                    fJM.sid = sid
-
-                    # Finally, need to set up transform function passed to GAMM
-                    def transform_X(X: scp.sparse.csc_array):
-                        return XJM
-
-                    transform_XJM = transform_X
-
-                    # And fit!
-                    g = GAMM(fJM, Gaussian(Identity(), scale=scale))
-
-                    g.fit(
-                        progress_bar=False,
-                        method="Chol",
-                        check_cond=0,
-                        n_cores=n_cores_gammlss,
-                        transform_X=transform_XJM,
-                    )
-
-                    if len(g.overall_penalties) == 0:
-                        jfmcoef = g.sample_post(n_ps=1, seed=seed)[:, 0]
-
-                    else:
-                        # Get Vp
-                        _, Vpr, _, _, ep, dBetadRhos = estimateVp(g)
-
-                        # Sample lam
-                        lam = np.exp(
-                            scp.stats.multivariate_normal.rvs(
-                                mean=ep.flatten(),
-                                cov=Vpr,
-                                size=1,
-                                random_state=seed,
-                            )
+                        # Now update formula
+                        y_flat, cov_flat, NAs_flat, y, cov, NAs, sid, _ = (
+                            fJM.encode_data(tdat)
                         )
 
-                        if len(ep) == 1:
-                            lam = np.array([lam])
+                        # Store encoding
+                        fJM.y_flat = y_flat
+                        fJM.cov_flat = cov_flat
+                        fJM.NOT_NA_flat = NAs_flat
+                        fJM.y = y
+                        fJM.cov = cov
+                        fJM.NOT_NA = NAs
+                        fJM.sid = sid
 
-                        next_lam.extend(lam / scale)
-
-                        # Sample coef given lam
-                        for lami in range(len(lam)):
-                            g.overall_penalties[lami].lam = lam[lami]
-                            g.overall_penalties[lami].frozen = True
+                        # And fit!
+                        g = GAMM(fJM, Gaussian(Identity(), scale=scale))
 
                         g.fit(
                             progress_bar=False,
                             method="Chol",
                             check_cond=0,
-                            restart=True,
                             n_cores=n_cores_gammlss,
-                            transform_X=transform_XJM,
                         )
+                        state_lp -= 0.5 * g.penalty
 
-                        jfmcoef = g.sample_post(n_ps=1, seed=seed)[:, 0]
+                        if sample_map:
+                            jfmcoef = g.coef.flatten()
+                            if len(g.overall_penalties) != 0:
+                                next_lam.extend(
+                                    [lam.lam / scale for lam in g.overall_penalties]
+                                )
 
-                    next_coef.extend(jfmcoef)
+                        elif len(g.overall_penalties) == 0:
+                            jfmcoef = g.sample_post(n_ps=1, seed=seed)[:, 0]
 
-                idx += 1
+                        else:
+                            # Get Vp
+                            _, Vpr, _, _, ep, dBetadRhos = estimateVp(g)
 
-    # Duration coef
-    for j in range(n_S * (1 if starts_with_first else 2)):
+                            # Sample lam
+                            lam = np.exp(
+                                scp.stats.multivariate_normal.rvs(
+                                    mean=ep.flatten(),
+                                    cov=Vpr,
+                                    size=1,
+                                    random_state=seed,
+                                )
+                            )
 
-        jdFam = d_fams[j]
-        if jdFam is not None:
+                            if len(ep) == 1:
+                                lam = np.array([lam])
 
-            # Extract formulas associated with duration model of this state
-            fJM = copy.deepcopy(formulas[idx : idx + jdFam.n_par])  # noqa: E203
+                            # Sample coef given lam
+                            for lami in range(len(lam)):
+                                # Enforce working infty limits
+                                lam[lami] = max(1e-7, lam[lami])
+                                lam[lami] = min(1e7, lam[lami])
 
-            ddat = fJM[0].data
-            ddat_idx = []
-            jdurs = []
+                                g.overall_penalties[lami].lam = lam[lami]
+                                g.overall_penalties[lami].frozen = True
 
-            for series in range(n_series):
-                sdur = durs[series]
+                            next_lam.extend(lam / scale)
 
-                if ddat.shape[0] == n_series:
+                            g.fit(
+                                progress_bar=False,
+                                method="Chol",
+                                check_cond=0,
+                                restart=True,
+                                n_cores=n_cores_gammlss,
+                            )
 
-                    for td in sdur[j]:
-                        jdurs.append(td[1])
-                        ddat_idx.append(series)
+                            jfmcoef = g.sample_post(n_ps=1, seed=seed)[:, 0]
 
-            if len(jdurs) == 0:
-                for par in range(jdFam.n_par):
-                    next_coef.extend([np.nan for _ in range(formulas[idx].n_coef)])
+                        # Collect coefficients and corresponding indices over which to average
+                        if len(avg_e_terms) != 0:
+                            avg_jm_coef = []
+                            avg_jm_indices = []
+                            avg_jm_indices_r = []
+                            for tidx in avg_e_terms:
+                                cidx = fJM.coef_idx_per_term[tidx]
+                                avg_jm_indices_r.extend(cidx)
+                                avg_jm_indices.extend(cidx + len(jcoef))
+                                avg_jm_coef.extend(g.coef[cidx].flatten())
+
+                            avg_j_coef += avg_jm_coef
+                            avg_j_cov += (g.lvi.T @ g.lvi * g.scale)[
+                                np.ix_(avg_jm_indices_r, avg_jm_indices_r)
+                            ]
+                            avg_j_indices.append(avg_jm_indices)
+
+                        jcoef.extend(jfmcoef)
+
                     idx += 1
-            else:
 
-                ddat = ddat.iloc[ddat_idx, :]
-                ddat[fJM[0].lhs.variable] = jdurs
-
-                for par in range(jdFam.n_par):
-
-                    # Update data of formula
-                    y_flat, cov_flat, NAs_flat, y, cov, NAs, sid = fJM[par].encode_data(
-                        ddat
-                    )
-
-                    # Store encoding
-                    fJM[par].y_flat = y_flat
-                    fJM[par].cov_flat = cov_flat
-                    fJM[par].NOT_NA_flat = NAs_flat
-                    fJM[par].y = y
-                    fJM[par].cov = cov
-                    fJM[par].NOT_NA = NAs
-                    fJM[par].sid = sid
-                    idx += 1
-
-                # Fit model
-                g = GAMMLSS(fJM, jdFam)
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    g.fit(
-                        progress_bar=False,
-                        method="Chol",
-                        n_cores=n_cores_gammlss,
-                        check_cond=0,
-                    )
-
-                # Get Vp
-                _, Vpr, _, _, ep, dBetadRhos = estimateVp(g)
-
-                # Sample lam
-                lam = np.exp(
-                    scp.stats.multivariate_normal.rvs(
-                        mean=ep.flatten(),
-                        cov=Vpr,
+                # Average over channels then sample
+                if len(avg_e_terms) != 0 and len(avg_j_indices) != 0:
+                    jcoef = np.array(jcoef)
+                    avg_j_coef /= M
+                    avg_j_cov /= M**2
+                    avg_j_cov = scp.stats.multivariate_normal.rvs(
+                        mean=avg_j_coef,
+                        cov=avg_j_cov,
                         size=1,
                         random_state=seed,
                     )
-                )
+                    for cidx in avg_j_indices:
+                        jcoef[cidx] = avg_j_coef
 
-                if len(ep) == 1:
-                    lam = np.array([lam])
+                next_coef.extend(jcoef)
 
-                next_lam.extend(lam)
+        # Duration coef
+        fidx = 0
+        for j in range(n_S * (1 if starts_with_first else 2)):
+            # print("d", step, j)
 
-                # Sample coef given lam
-                for lami in range(len(lam)):
-                    g.overall_penalties[lami].lam = lam[lami]
-                    g.overall_penalties[lami].frozen = True
+            jdFam = d_fams[j]
+            if jdFam is not None:
 
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    g.fit(
-                        progress_bar=False,
-                        method="Chol",
-                        check_cond=0,
-                        n_cores=n_cores_gammlss,
-                        restart=True,
-                    )
+                # Extract formulas associated with duration model of this state
+                fJM = copy.deepcopy(formulas[idx : idx + jdFam.n_par])  # noqa: E203
 
-                jfmcoef = []
-                for par in range(jdFam.n_par):
-                    jfmcoef.extend(
-                        g.sample_post(n_ps=1, seed=seed, par=par)[:, 0].flatten()
-                    )
+                ddat = fJM[0].data
+                ddat_idx = []
+                jdurs = []
 
-                # print(jfmcoef)
-                next_coef.extend(jfmcoef)
+                for series in range(n_series):
+                    sdur = durs[series]
 
-    next_coef = np.array(next_coef).reshape(-1, 1)
-    next_coef[np.isnan(next_coef)] = coef[np.isnan(next_coef)]
-    next_lam = np.array(next_lam)
+                    for td in sdur[j]:
+                        offset = 0
+                        if fam.hmp_d_offset:
+                            offset = (
+                                event_width // 2
+                                if (fidx in [flats[series][0], flats[series][-1]])
+                                else event_width
+                            )
 
-    return_dict[chain_id] = [next_coef, next_lam]
+                        jdurs.append(td[1] + offset)
+                        ddat_idx.append(series)
+
+                if len(jdurs) == 0:
+                    for par in range(jdFam.n_par):
+                        next_coef.extend([np.nan for _ in range(formulas[idx].n_coef)])
+                        idx += 1
+                else:
+
+                    ddat = ddat.iloc[ddat_idx, :]
+                    ddat[fJM[0].lhs.variable] = jdurs
+
+                    for par in range(jdFam.n_par):
+
+                        # Update data of formula
+                        y_flat, cov_flat, NAs_flat, y, cov, NAs, sid, _ = fJM[
+                            par
+                        ].encode_data(ddat)
+
+                        # Store encoding
+                        fJM[par].y_flat = y_flat
+                        fJM[par].cov_flat = cov_flat
+                        fJM[par].NOT_NA_flat = NAs_flat
+                        fJM[par].y = y
+                        fJM[par].cov = cov
+                        fJM[par].NOT_NA = NAs
+                        fJM[par].sid = sid
+                        idx += 1
+
+                    # Fit model
+                    g = GAMMLSS(fJM, jdFam)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        g.fit(
+                            progress_bar=False,
+                            method="Chol",
+                            n_cores=n_cores_gammlss,
+                            check_cond=0,
+                        )
+                    state_lp -= 0.5 * g.penalty
+
+                    if sample_map:
+                        jfmcoef = g.coef.flatten()
+                        if len(g.overall_penalties) != 0:
+                            next_lam.extend([lam.lam for lam in g.overall_penalties])
+
+                    else:
+                        if len(g.overall_penalties) != 0:
+                            # Get Vp
+                            _, Vpr, _, _, ep, _ = estimateVp(g)
+
+                            # Sample lam
+                            lam = np.exp(
+                                scp.stats.multivariate_normal.rvs(
+                                    mean=ep.flatten(),
+                                    cov=Vpr,
+                                    size=1,
+                                    random_state=seed,
+                                )
+                            )
+
+                            if len(ep) == 1:
+                                lam = np.array([lam])
+
+                            # Sample coef given lam
+                            for lami in range(len(lam)):
+                                # Enforce working infty limits
+                                lam[lami] = max(1e-7, lam[lami])
+                                lam[lami] = min(1e7, lam[lami])
+
+                                g.overall_penalties[lami].lam = lam[lami]
+                                g.overall_penalties[lami].frozen = True
+
+                            next_lam.extend(lam)
+
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore")
+                                g.fit(
+                                    progress_bar=False,
+                                    method="Chol",
+                                    check_cond=0,
+                                    n_cores=n_cores_gammlss,
+                                    restart=True,
+                                )
+
+                        jfmcoef = []
+                        for par in range(jdFam.n_par):
+                            jfmcoef.extend(
+                                g.sample_post(n_ps=1, seed=seed, par=par)[
+                                    :, 0
+                                ].flatten()
+                            )
+
+                    # print(jfmcoef)
+                    next_coef.extend(jfmcoef)
+
+                fidx += 2
+
+        res_coef[:, step] = next_coef
+        res_coef[np.isnan(next_coef), step] = coef[np.isnan(next_coef), 0]
+        coef = res_coef[:, [step]].copy()
+        # Update llk
+        state_lp += fam.llk(coef, coef_split_idx, ys, Xs)
+        res_lam[:, step] = np.array(next_lam)
+        res_lp[0, step] = state_lp
+        seed += step
+
+    return_dict[chain_id] = [res_lp, res_coef, res_lam]
 
 
 def sample_hmp(
@@ -1324,6 +2345,9 @@ def sample_hmp(
     callback=None,
     n_chains=2,
     parallelize_chains=True,
+    n_steps=100,
+    sample_map: bool = False,
+    avg_e_terms: list = [],
 ) -> tuple[np.ndarray, np.ndarray, GSMM]:
     """Laplace approximate beam sampler for a HMP-like HsMM as discussed by by Krause, van Rij, and
     Borst (submitted).
@@ -1332,6 +2356,7 @@ def sample_hmp(
         the average coefficients.
     :rtype: tuple[np.ndarray, np.ndarray, GSMM]
     """
+    np_gen = np.random.default_rng(seed)
 
     # Extract families, transition matrices, etc.
     n_S = fam.llkargs[0]
@@ -1340,7 +2365,6 @@ def sample_hmp(
     M = fam.llkargs[6]
     starts_with_first = fam.llkargs[7]
     n_cores = fam.llkargs[10]
-    Lrhoi = fam.llkargs[16]
     scale = fam.llkargs[17]
     event_template = fam.llkargs[18]
     hmp_fam = fam.llkargs[19]
@@ -1370,8 +2394,12 @@ def sample_hmp(
     for chain in range(n_chains):
         lams.append(np.ones(n_lam))
 
+    lp_samples = np.zeros((n_chains, n_iter, 1))
     coef_samples = np.zeros((n_chains, n_iter, len(coefs[0])))
-    lam_samples = np.zeros((n_chains, n_iter, n_lam))
+
+    lam_samples = None
+    if n_lam > 0:
+        lam_samples = np.zeros((n_chains, n_iter, n_lam))
 
     manager = None
     if parallelize_chains:
@@ -1380,16 +2408,31 @@ def sample_hmp(
     hsmm = GSMM(formulas, family=fam)
     hsmm.coef = np.ones(len(coefs[0])).reshape(-1, 1)
     hsmm.coef_split_idx = coef_split_idx
-    hsmm.lvi = scp.sparse.csc_array(scp.sparse.eye(len(coefs[0])))
+    hsmm.lvi = np.identity(len(coefs[0]))
 
-    iterator = tqdm(range(n_iter + n_burnin), desc="Warming up...", leave=True)
-    for iter in iterator:
+    pbar = tqdm(total=n_iter + n_burnin, desc="Warming up...", leave=True)
+    iter = 0
+    while iter < (n_iter + n_burnin):
+
+        # Calculate steps to take
+        if iter < n_burnin:
+            if iter + n_steps <= n_burnin:
+                steps = n_steps
+            else:
+                steps = n_burnin - iter
+        else:
+            if iter + n_steps <= (n_iter + n_burnin):
+                steps = n_steps
+            else:
+                steps = (n_iter + n_burnin) - iter
 
         return_dict = manager.dict() if parallelize_chains else dict()
 
         chains = []
 
         for chain in range(n_chains):
+
+            chain_seed = int(np_gen.random() * 10000)
 
             args = (
                 chain,
@@ -1401,20 +2444,20 @@ def sample_hmp(
                 coef_split_idx,
                 formulas,
                 Xs,
-                ys,
+                fam.cross_cor,
                 n_series,
                 n_S,
                 M,
-                Lrhoi,
                 scale,
                 starts_with_first,
                 event_template,
                 n_cores_td,
                 n_cores,
-                seed,
+                chain_seed,
+                steps,
+                sample_map,
+                avg_e_terms,
             )
-
-            seed += 1
 
             if parallelize_chains:
                 chains.append(mp.Process(target=advance_chain_hmp, args=args))
@@ -1428,29 +2471,40 @@ def sample_hmp(
             if parallelize_chains:
                 chains[chain].join()
 
-            coefs[chain] = return_dict[chain][0]
-            lams[chain] = return_dict[chain][1]
+            coefs[chain] = return_dict[chain][1][:, [-1]]
+            lams[chain] = return_dict[chain][2][:, -1]
 
             if iter >= n_burnin:
-                coef_samples[chain, iter - n_burnin, :] = coefs[chain][:, 0]
-                lam_samples[chain, iter - n_burnin, :] = lams[chain][:]
+                sidx = iter - n_burnin
+                eidx = sidx + steps
+                lp_samples[chain, sidx:eidx, 0] = return_dict[chain][0][0, :]
+                coef_samples[chain, sidx:eidx, :] = return_dict[chain][1].T
+                if n_lam > 0:
+                    lam_samples[chain, sidx:eidx, :] = return_dict[chain][2].T
 
-        # Check convergence:
-        if iter >= n_burnin:
+        iter += steps
 
-            if (iter - n_burnin) == 0:
-                iterator.set_description_str(desc="Sampling...", refresh=True)
+        pbar.update(steps)
 
-            if (iter - n_burnin) >= (max(8, 4 * n_chains)) and (
-                iter - n_burnin
-            ) % 2 == 0:
+        if (iter - n_burnin) == 0:
+            pbar.set_description_str(desc="Sampling...", refresh=True)
 
-                conv_samples_coef = coef_samples[:, : (iter - n_burnin) + 1, :]
-                conv_samples_lam = np.log(lam_samples[:, : (iter - n_burnin) + 1, :])
+        # Convergence:
+        if iter > n_burnin:
+
+            if ((iter - n_burnin) // 4) > (2 * n_chains):
+
+                conv_samples_lp = lp_samples[:, : (iter - n_burnin), :]
+                conv_samples_coef = coef_samples[:, : (iter - n_burnin), :]
+                conv_samples_lam = None
+                if n_lam > 0:
+                    conv_samples_lam = np.log(lam_samples[:, : (iter - n_burnin), :])
 
                 ess, rhat, mcse = check_convergence(
                     conv_samples_coef,
                     None,
+                    None,
+                    conv_samples_lp,
                     conv_samples_lam,
                     hsmm,
                     type=0,
@@ -1462,56 +2516,56 @@ def sample_hmp(
                     f"Max. MCSE: {np.round(np.max(mcse), decimals=2)}"
                 )
 
-                iterator.set_description_str(desc=desc, refresh=True)
+                pbar.set_description_str(desc=desc, refresh=True)
 
             # Callback (optional)
             if callback is not None:
                 callback(
                     iter - n_burnin,
-                    coef_samples[:, : (iter - n_burnin) + 1, :],
-                    lam_samples[:, : (iter - n_burnin) + 1, :],
+                    coef_samples[:, : (iter - n_burnin), :],
+                    lam_samples[:, : (iter - n_burnin), :] if n_lam > 0 else None,
                 )
 
     # Create GSMM object with mean coef and approx. covariance matrix of samples
     mean_coef = np.mean(coef_samples, axis=(0, 1)).reshape(-1, 1)
 
     # Get approximate covariance matrix
-    lviT = None
     cov_samples = np.concatenate(
         [coef_samples[chain, :, :].T for chain in range(n_chains)], axis=1
     )
 
     try:
         V = np.cov(cov_samples)
-        lviT = scp.linalg.cholesky(V)
+        eigV, U = scp.linalg.eigh(V)
+
+        # Enforce PD
+        eps = np.power(np.finfo(float).eps, 0.5)
+        thresh = eps * np.max(np.abs(eigV))
+        eigV[eigV <= thresh] = thresh
+
+        # Get root
+        lvi = np.diag(np.sqrt(eigV)) @ U.T
+
     except:  # noqa
         warnings.warn(
             (
-                "Failed to compute Cholesky of Covariance matrix of samples. "
-                "Falling back to regularized covariance matrix."
+                "Failed to compute Root of regularized Covariance matrix "
+                "of samples. Setting ``lvi`` attribute of returned "
+                "hsmm to identity."
             )
         )
-
-    if lviT is None:
-        try:
-            V = np.cov(cov_samples) + 1e-9 * np.identity(len(coefs[0]))
-            lviT = scp.linalg.cholesky(V)
-        except:  # noqa
-            warnings.warn(
-                (
-                    "Failed to compute Cholesky of regularized Covariance matrix "
-                    "of samples. Setting ``lvi`` attribute of returned "
-                    "hsmm to identity."
-                )
-            )
-
-    if lviT is None:
-        lviT = scp.sparse.eye(len(coefs[0]))
+        lvi = np.identity(len(coefs[0]))
 
     hsmm.coef = mean_coef
-    hsmm.lvi = scp.sparse.csc_array(lviT)
+    hsmm.lvi = lvi
 
-    return coef_samples, lam_samples, hsmm
+    res = SamplerResult(
+        lp_samples,
+        coef_samples,
+        rhos=None if lam_samples is None else np.log(lam_samples),
+    )
+
+    return res, hsmm
 
 
 def plot_hsmm(
@@ -1557,6 +2611,11 @@ def plot_hsmm(
     topo_width: int = 10,
     topo_height_rel: float = 2,
     positions: np.ndarray | None = None,
+    highlight_state_1: int | None = None,
+    highlight_state_2: int | None = None,
+    highlight_d: int | None = None,
+    max_emission_time: None | int = None,
+    hide_densities: bool = False,
     fig: matplotlib.figure.Figure | None = None,
     axs: list[matplotlib.axes._axes.Axes] | None = None,
 ):
@@ -1594,7 +2653,10 @@ def plot_hsmm(
         tid = sid
 
     if isinstance(T, list):
-        T = T[series]
+        T = T[fam.T_index[series]]
+
+    if isinstance(pi, list):
+        pi = pi[fam.pi_index[series]]
 
     if fix_T_pi is False:
         ps = fam.compute_Tpi(coef, coef_split_idx, ys, Xs)
@@ -1635,8 +2697,21 @@ def plot_hsmm(
     if network_graph:
 
         G = nx.MultiDiGraph()
-
+        edgecolors = [
+            (
+                "red"
+                if highlight_state_1 is not None and 0 == highlight_state_1
+                else "black"
+            )
+        ]
         for j in range(n_S):
+
+            if highlight_state_1 is not None and (j + 1) == highlight_state_1:
+                edgecolors.append("red")
+            elif highlight_state_2 is not None and (j + 1) == highlight_state_2:
+                edgecolors.append("red")
+            else:
+                edgecolors.append("black")
 
             jrad = 0.15
             if j == int(n_S / 2) and n_S % 2 != 0:
@@ -1672,7 +2747,7 @@ def plot_hsmm(
             ax=ax,
             node_size=200,
             node_color=["white", *state_cmp(state_colors)],
-            edgecolors="black",
+            edgecolors=edgecolors,
         )
         nx.draw_networkx_labels(
             G,
@@ -1954,6 +3029,16 @@ def plot_hsmm(
     flat_idx = 0
     for state in range(n_S):
 
+        if hide_densities:
+            continue
+
+        if (
+            highlight_state_2 is not None
+            and highlight_d is not None
+            and (state + 1) == highlight_state_2
+        ):
+            ax.axvline(highlight_d, color=state_cmp(state), linestyle="dashed")
+
         if is_hmp and state % 2 == 1:
             continue
 
@@ -1961,7 +3046,7 @@ def plot_hsmm(
             [*np.arange(1, plot_D + 1), *np.flip(np.arange(1, plot_D + 1))],
             [*avg_d_dens[:plot_D, state], *np.zeros(plot_D)],
             alpha=0.5,
-            color=state_cmp(state),
+            color=state_cmp(flat_idx if is_hmp else state),
         )
         hd = ax.plot(
             np.arange(1, plot_D + 1),
@@ -1972,7 +3057,7 @@ def plot_hsmm(
                 else None
             ),
             linestyle=("solid" if starts_with_first else "dashed"),
-            color=state_cmp((flat_idx) if is_hmp else state),
+            color=state_cmp(flat_idx if is_hmp else state),
         )
         flat_idx += 1
         if starts_with_first:
@@ -2025,11 +3110,14 @@ def plot_hsmm(
 
     time = np.arange(emission_pred.shape[0])
 
+    if max_emission_time is None:
+        max_emission_time = emission_pred.shape[0]
+
     m = 0
     for m in emission_iterator:
         ax.plot(
-            time,
-            emission_pred[:, m],
+            time[:max_emission_time],
+            emission_pred[:max_emission_time, m],
             label=emission_label + f": {m+1}",
             color=emissions_cmp(emission_colors[m]),
             alpha=1,
@@ -2042,6 +3130,7 @@ def plot_hsmm(
     y_ticks = [*np.linspace(dat_min - 0.1 * dat_sd, dat_max + 3.5 * dat_sd, 5)]
 
     ax.set_yticks(y_ticks)
+    ax.set_xlim(0, emission_pred.shape[0])
     ax.set_ylabel("Emissions", fontweight="bold")
     ax.tick_params(bottom=False, labelbottom=False)
     ax.spines["left"].set_visible(True)
@@ -2053,7 +3142,9 @@ def plot_hsmm(
     divider = make_axes_locatable(ax)
     ax3 = divider.append_axes("bottom", size="20%", pad=0.2)
     # print(ax2, ax3)
-    ax3.plot(time, state_pred + 1, color="black")
+    ax3.plot(
+        time[:max_emission_time], state_pred[:max_emission_time] + 1, color="black"
+    )
 
     if plot_state_labels:
         ax3.set_yticks(np.arange(n_S) + 1)
@@ -2064,20 +3155,22 @@ def plot_hsmm(
     ax3.spines["top"].set_visible(False)
     ax3.spines["right"].set_visible(False)
     ax3.set_xlabel("Time", fontweight="bold")
+    ax3.set_xlim(0, emission_pred.shape[0])
 
     ax.legend(loc="upper right", ncol=1, frameon=False)
 
-    fig.legend(
-        handles=handles,
-        loc="lower center",
-        ncol=min(n_S, max_ncol_leg),
-        bbox_transform=fig.transFigure,
-        bbox_to_anchor=(0.5, -0.1),
-        frameon=False,
-    )
+    if fig is not None:
+        fig.legend(
+            handles=handles,
+            loc="lower center",
+            ncol=min(n_S, max_ncol_leg),
+            bbox_transform=fig.transFigure,
+            bbox_to_anchor=(0.5, -0.1),
+            frameon=False,
+        )
 
-    fig.align_xlabels()
-    fig.align_titles()
+        fig.align_xlabels()
+        fig.align_titles()
 
     if call_plot:
         plt.plot()
